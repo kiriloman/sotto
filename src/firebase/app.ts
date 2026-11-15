@@ -48,13 +48,12 @@ export function readFirebaseConfig(): SottoFirebaseConfig | null {
   }
 }
 
-let firebaseBootstrapped = false; // React StrictMode double-mount guard
+let firebaseSetupCache: FirebaseSetup | null = null; // StrictMode double-mount: return the SAME setup
 
 export function setupFirebase(): FirebaseSetup | null {
-  if (firebaseBootstrapped) return null; // already initialized this session
+  if (firebaseSetupCache) return firebaseSetupCache; // already bootstrapped — never report "no config" on a remount
   const config = readFirebaseConfig();
   if (!config) return null;
-  firebaseBootstrapped = true;
 
   const app = initializeApp(config);
 
@@ -100,7 +99,8 @@ export function setupFirebase(): FirebaseSetup | null {
     remoteConfig = null;
   }
 
-  return { app, remoteConfig };
+  firebaseSetupCache = { app, remoteConfig };
+  return firebaseSetupCache;
 }
 
 /** Fetch-and-activate Remote Config, then read thresholds. Resolves with

@@ -13,10 +13,9 @@ import {
   type JournalEntry,
   type InferenceReceipt,
 } from './storage/db.ts';
-import { FirebaseAiProvider, MockProvider, type AiProvider, type RunOptions } from './ai/provider.ts';
+import type { AiProvider, RunOptions } from './ai/provider.ts';
 import { parseEntryAnalysis, parseTitle, TASK_LABELS, type DeepDiveTurn } from './ai/prompts.ts';
-import { setupFirebase, activateAndReadThresholds } from './firebase/app.ts';
-import { EntrySync } from './firebase/sync.ts';
+import type { EntrySync } from './firebase/sync.ts';
 import { DEFAULT_THRESHOLDS, type RoutingThresholds, type DeviceState } from './router/policy.ts';
 import { RouterBadge } from './ui/RouterBadge.tsx';
 
@@ -41,17 +40,24 @@ export default function App() {
   const [search, setSearch] = useState('');
 
   // Boot: open store, wire Firebase (or demo mode), probe device.
+  // The Firebase + AI SDK load in an async chunk so the journal paints first —
+  // a journaling app shouldn't wait on an 800 kB SDK to show an editor.
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       await store.open();
+      if (cancelled) return;
       setEntries(await store.listEntries());
       setReceipts(await store.listReceipts());
+      const [{ setupFirebase, activateAndReadThresholds }, { FirebaseAiProvider, MockProvider }, { EntrySync: EntrySyncImpl }] =
+        await Promise.all([import('./firebase/app.ts'), import('./ai/provider.ts'), import('./firebase/sync.ts')]);
+      if (cancelled) return;
       const fb = setupFirebase();
       if (fb) {
         const p = new FirebaseAiProvider(fb.app);
         setProvider(p);
         setDevice(await p.probeDevice());
-        const s = new EntrySync(fb.app);
+        const s = new EntrySyncImpl(fb.app);
         setSync(s);
         void s.start();
         // Remote Config: first paint uses local defaults; fetched values
@@ -61,6 +67,9 @@ export default function App() {
         setProvider(new MockProvider());
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [store]);
 
   // Re-probe on online/offline changes (the provider also re-probes before
@@ -825,7 +834,12 @@ function WeeklySynthesis(props: {
     try {
       // Private entries are structurally excluded from a standard synthesis —
       // the per-entry hard rule cannot be overridden by an aggregate toggle.
-      const { text: joined, excludedPrivate } = synthesisInput(props.entries, from, to);
+      const { text: joined, excludedPrivate } = synthesisInput(props.entries, from, to, {
+        // Private-tier synthesis INCLUDES private entries — it routes on-device
+        // or degrades, never cloud, so the input can safely contain them.
+        // Standard-tier synthesis excludes them (per-entry hard rule).
+        includePrivate: privacy === 'private',
+      });
       setExcludedNote(
         excludedPrivate > 0
           ? `${excludedPrivate} private ${excludedPrivate === 1 ? 'entry was' : 'entries were'} kept on this device and excluded from the synthesis — their 🔒 rule is not overridden by this toggle.`
