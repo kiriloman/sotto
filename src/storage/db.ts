@@ -8,6 +8,7 @@
 // when IndexedDB is unavailable). Pure data layer: no UI, no AI.
 
 import type { PrivacyTier } from '../router/policy.ts';
+import type { DeepDiveTurn } from '../ai/prompts.ts';
 
 export interface JournalEntry {
   id: string;
@@ -20,6 +21,7 @@ export interface JournalEntry {
   mood?: string; // from entry analysis, if analyzed
   analysis?: { mood: string; themes: string[]; oneLineSummary: string };
   reflection?: string; // quick-reflection output, if generated
+  deepDive?: DeepDiveTurn[]; // conversation history with the entry
 }
 
 export interface InferenceReceipt {
@@ -27,11 +29,19 @@ export interface InferenceReceipt {
   at: number;
   task: string;
   entryId?: string;
+  /** Where the work actually ran ('mock' = deterministic demo response). */
   path: 'on-device' | 'cloud' | 'degraded' | 'mock';
+  /** Where the router decided it should run. */
+  requestedPath?: 'on-device' | 'cloud' | 'degraded';
+  /** The InferenceMode string sent to the SDK. */
+  requestedMode?: string;
+  /** True when the SDK served from a different path than requested (red in the ledger). */
+  drifted?: boolean;
   reasons: string[];
   inputChars: number;
+  inputTokens?: number;
   latencyMs?: number;
-  inferenceSource?: string; // SDK-reported: ON_DEVICE | IN_CLOUD
+  inferenceSource?: string; // SDK-reported: 'on_device' | 'in_cloud'
   mode: 'real' | 'demo'; // real Firebase AI Logic vs labeled mock
 }
 

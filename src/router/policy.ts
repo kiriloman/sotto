@@ -12,8 +12,8 @@ export type TaskId =
   | 'entry-analysis' // mood + themes + tags for one entry (structured JSON)
   | 'title-suggest' // short title for one entry
   | 'quick-reflection' // single-paragraph reflection prompt on one entry
-  | 'weekly-synthesis' // synthesis across all entries in a period
-  | 'deep-dive'; // follow-up Q&A about one entry
+  | 'weekly-synthesis' // synthesis across entries in a period
+  | 'deep-dive'; // conversation about one entry (history-aware Q&A)
 
 export type PrivacyTier = 'private' | 'standard';
 
@@ -27,47 +27,24 @@ export type PrivacyTier = 'private' | 'standard';
  * letting the SDK fall back silently. That refusal is the product.
  */
 export interface TaskPolicy {
-  /** Task needs multi-turn conversation (unsupported on-device). */
-  requiresChat: boolean;
-  /** Task needs context longer than the on-device token cap. */
-  requiresLongContext: boolean;
-  /** Task output is structured JSON (supported on-device). */
-  structuredOutput: boolean;
-  /** Default desired path when everything is available. */
+  /** Task maintains a conversation history — on-device supports single-turn only. */
+  requiresConversation: boolean;
+  /** Task's desired path when everything is available. Long inputs are still
+   *  size-routed by the engine (a small week can run fully on-device). */
   preferredPath: 'on-device' | 'cloud';
 }
 
 export const TASK_POLICIES: Record<TaskId, TaskPolicy> = {
-  'entry-analysis': {
-    requiresChat: false,
-    requiresLongContext: false,
-    structuredOutput: true,
-    preferredPath: 'on-device', // small, private, frequent — the on-device showcase
-  },
-  'title-suggest': {
-    requiresChat: false,
-    requiresLongContext: false,
-    structuredOutput: true,
-    preferredPath: 'on-device',
-  },
-  'quick-reflection': {
-    requiresChat: false,
-    requiresLongContext: false,
-    structuredOutput: false,
-    preferredPath: 'on-device',
-  },
-  'weekly-synthesis': {
-    requiresChat: false,
-    requiresLongContext: true, // full history — exceeds the 9216-token cap
-    structuredOutput: false,
-    preferredPath: 'cloud',
-  },
-  'deep-dive': {
-    requiresChat: true, // follow-up questions — on-device has no chat
-    requiresLongContext: false,
-    structuredOutput: false,
-    preferredPath: 'cloud',
-  },
+  'entry-analysis': { requiresConversation: false, preferredPath: 'on-device' },
+  'title-suggest': { requiresConversation: false, preferredPath: 'on-device' },
+  'quick-reflection': { requiresConversation: false, preferredPath: 'on-device' },
+  // Synthesis prefers cloud for reasoning quality over full history, but the
+  // engine decides by measured input size: a small week fits on-device (and a
+  // fully-private small week then synthesizes locally — a feature, not a bug).
+  'weekly-synthesis': { requiresConversation: false, preferredPath: 'cloud' },
+  // Deep dive is genuinely conversational: each answer is fed back as history
+  // for the next question (see ai/prompts.ts buildPrompt + App deepDive state).
+  'deep-dive': { requiresConversation: true, preferredPath: 'cloud' },
 };
 
 /**
@@ -77,11 +54,35 @@ export const TASK_POLICIES: Record<TaskId, TaskPolicy> = {
  */
 export const ON_DEVICE_TOKEN_CAP = 9216;
 export const CHARS_PER_TOKEN = 4;
-/** Tokens reserved for the system prompt + output schema when budgeting. */
+/** Tokens reserved for the system prompt + output when budgeting. */
 export const PROMPT_OVERHEAD_TOKENS = 1200;
 
 export function onDeviceCharBudget(): number {
   return (ON_DEVICE_TOKEN_CAP - PROMPT_OVERHEAD_TOKENS) * CHARS_PER_TOKEN;
+}
+
+export function onDeviceTokenBudget(): number {
+  return ON_DEVICE_TOKEN_CAP - PROMPT_OVERHEAD_TOKENS;
+}
+
+/**
+ * Conservative token estimate. English ≈ chars/4 (over-estimates — safe),
+ * but CJK text runs ~1 token per character, so a 10k-char Chinese entry
+ * would blow the real on-device cap while passing a naive chars/4 check.
+ * CJK/fullwidth chars are counted as one token each (reviewer-verified fix).
+ */
+export function estimateTokens(text: string): number {
+  let tokens = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    const isCJK =
+      (code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+      (code >= 0x3040 && code <= 0x30ff) || // Hiragana/Katakana
+      (code >= 0xac00 && code <= 0xd7af) || // Hangul
+      (code >= 0xff00 && code <= 0xffef); // Fullwidth forms
+    tokens += isCJK ? 1 : 0.25;
+  }
+  return Math.ceil(tokens);
 }
 
 /**

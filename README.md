@@ -68,13 +68,13 @@ npm run build      # typecheck + production build
 ## Repository layout
 
 ```
-src/router/    engine.ts (deterministic router), policy.ts (capability table + thresholds)
+src/router/    engine.ts (deterministic router), policy.ts (capability table + budgets)
 src/ai/        provider.ts (Firebase AI Logic + labeled mock), prompts.ts (prompts + parsing)
 src/storage/   db.ts (IndexedDB, memory fallback, synthesis input builder)
-src/firebase/  app.ts (config injection, App Check, Remote Config)
+src/firebase/  app.ts (config injection, App Check, Remote Config), sync.ts (opt-in Firestore sync)
 src/ui/        RouterBadge.tsx (the honesty widget)
 src/App.tsx    journal / week-in-review / inference-ledger tabs
-tests/         router.test.ts, prompts.test.ts, storage.test.ts (31 tests)
+tests/         router.test.ts, prompts.test.ts, storage.test.ts (37 tests)
 ```
 
 ## Honest limitations

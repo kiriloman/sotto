@@ -110,3 +110,23 @@ button.ghost:hover { border-color: var(--accent); }
 
 .empty { color: var(--muted); text-align: center; padding: 40px 0; font-style: italic; }
 a { color: var(--accent); }
+
+/* R1-fix additions */
+.search-row { margin-bottom: 14px; }
+.search-row input { max-width: 420px; }
+
+.entry .analysis.pending { border: 1px dashed var(--border); color: var(--muted); }
+button.linkish { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; font-size: 14px; padding: 0; text-decoration: underline; }
+
+.ledger .receipt.drifted { border-left: 3px solid var(--danger); padding-left: 10px; }
+.drift-tag { color: var(--danger); font-size: 12px; font-family: ui-monospace, monospace; margin-left: 6px; }
+
+.dive-turn { margin-bottom: 8px; }
+.dive-turn .q { color: var(--accent); font-weight: 600; }
+.dive-turn .a { margin-top: 2px; }
+
+.mood-timeline { margin: 10px 0; font-size: 17px; }
+
+.sync-toggle { margin-left: auto; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+
+button.ghost.danger { border-color: var(--danger); color: var(--danger); }

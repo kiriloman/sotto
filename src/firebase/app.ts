@@ -55,20 +55,34 @@ export function setupFirebase(): FirebaseSetup | null {
   const app = initializeApp(config);
 
   // App Check is REQUIRED for Firebase AI Logic (enforced since Nov 2026).
-  // Localhost: debug provider (console prints a token to safelist).
-  // Production: reCAPTCHA v3 (site key injected with the config).
+  // Localhost: debug provider (console prints a token to safelist in the
+  // Firebase console). Deployed origins REQUIRE a reCAPTCHA v3 site key —
+  // without one, App Check breaks asynchronously (the try/catch around
+  // initializeAppCheck is theater: the failure surfaces later as opaque
+  // errors on every cloud inference). So we fail LOUDLY instead of pretending.
   if (typeof window !== 'undefined') {
     const isLocal = ['localhost', '127.0.0.1'].includes(window.location.hostname);
-    if (isLocal || !config.appCheckSiteKey) {
-      if (isLocal) window.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+    if (isLocal) {
+      window.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
       try {
         initializeAppCheck(app, {
-          provider: new ReCaptchaV3Provider(config.appCheckSiteKey ?? 'placeholder'),
+          provider: new ReCaptchaV3Provider('placeholder'),
           isTokenAutoRefreshEnabled: true,
         });
-      } catch {
-        // App Check optional in dev — AI Logic calls may fail without it.
+      } catch (err) {
+        console.error('[Sotto] App Check debug provider failed to initialize:', err);
       }
+    } else if (!config.appCheckSiteKey) {
+      console.error(
+        '[Sotto] App Check: no appCheckSiteKey configured for a non-localhost origin. ' +
+          'Firebase AI Logic requires App Check — every cloud inference will fail. ' +
+          'Register a reCAPTCHA v3 site key and pass it as appCheckSiteKey in __SOTTO_FIREBASE_CONFIG__.'
+      );
+    } else {
+      initializeAppCheck(app, {
+        provider: new ReCaptchaV3Provider(config.appCheckSiteKey),
+        isTokenAutoRefreshEnabled: true,
+      });
     }
   }
 
@@ -76,12 +90,27 @@ export function setupFirebase(): FirebaseSetup | null {
   try {
     remoteConfig = getRemoteConfig(app);
     remoteConfig.settings.minimumFetchIntervalMillis = 3600_000;
-    void fetchAndActivate(remoteConfig).catch(() => undefined);
+    // Note: the caller re-reads thresholds after this resolves (see App boot)
+    // — first paint uses local defaults, fetched values apply as soon as they land.
   } catch {
     remoteConfig = null;
   }
 
   return { app, remoteConfig };
+}
+
+/** Fetch-and-activate Remote Config, then read thresholds. Resolves with
+ *  local defaults when fetch fails — the app never depends on it. */
+export async function activateAndReadThresholds(
+  rc: RemoteConfig | null
+): Promise<RoutingThresholds> {
+  if (!rc) return { ...DEFAULT_THRESHOLDS };
+  try {
+    await fetchAndActivate(rc);
+  } catch {
+    // offline / not configured — fall through to defaults
+  }
+  return thresholdsFromRemoteConfig(rc);
 }
 
 /** Routing thresholds from Remote Config, falling back to local defaults. */

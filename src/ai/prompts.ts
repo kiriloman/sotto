@@ -1,15 +1,24 @@
-// Sotto — task prompts and structured-output schemas.
+// Sotto — task prompts.
 //
 // Every task that goes through the router has its prompt defined here, so
 // the on-device and cloud paths run byte-identical instructions. Structured
-// tasks (analysis, title) use responseSchema — supported on BOTH paths.
+// tasks (analysis, title) ask for JSON in the prompt itself and are parsed
+// tolerantly (parseEntryAnalysis handles fenced/prose-wrapped JSON) — a
+// deliberate choice that works identically on both inference paths rather
+// than SDK schema plumbing that differs between them.
 
-import type { TaskId } from '../router/policy';
+import type { TaskId } from '../router/policy.ts';
 
 export interface EntryAnalysis {
   mood: 'great' | 'good' | 'neutral' | 'low' | 'rough';
   themes: string[];
   oneLineSummary: string;
+}
+
+export interface DeepDiveTurn {
+  q: string;
+  a: string;
+  at: number;
 }
 
 export const TASK_LABELS: Record<TaskId, string> = {
@@ -28,7 +37,12 @@ export function systemPrompt(): string {
   return SYSTEM_PROMPT;
 }
 
-export function buildPrompt(task: TaskId, input: string, extra?: string): string {
+export function buildPrompt(
+  task: TaskId,
+  input: string,
+  extra?: string,
+  history?: { q: string; a: string }[]
+): string {
   switch (task) {
     case 'entry-analysis':
       return (
@@ -63,44 +77,21 @@ export function buildPrompt(task: TaskId, input: string, extra?: string): string
         '(3) one gentle suggestion for next week. Warm, concise, grounded in the entries only.'
       );
     }
-    case 'deep-dive':
+    case 'deep-dive': {
+      const question = extra ?? '(no question provided)';
+      const turns = (history ?? [])
+        .map((t, i) => `Q${i + 1}: ${t.q}\nA${i + 1}: ${t.a}`)
+        .join('\n\n');
       return (
-        'Answer the question about this journal entry. Ground every claim in the entry; say so when the entry does not contain the answer.\n\n' +
-        `Question: ${extra ?? '(no question provided)'}\n\n---\n` +
+        'You are discussing this journal entry with its author. Answer the question, using the ' +
+        'conversation so far as context. Ground every claim in the entry; say so when the entry ' +
+        'does not contain the answer.\n\n' +
+        (turns ? `Conversation so far:\n${turns}\n\n` : '') +
+        `Question: ${question}\n\n---\n` +
         input +
         '\n---'
       );
-  }
-}
-
-/** JSON schema for structured-output tasks (Firebase AI Logic responseSchema).
- *  Only used by tasks whose policy sets structuredOutput: true. */
-export const ENTRY_ANALYSIS_SCHEMA = {
-  type: 'OBJECT',
-  properties: {
-    mood: { type: 'STRING', enum: ['great', 'good', 'neutral', 'low', 'rough'] },
-    themes: { type: 'ARRAY', items: { type: 'STRING' } },
-    oneLineSummary: { type: 'STRING' },
-  },
-  required: ['mood', 'themes', 'oneLineSummary'],
-} as const;
-
-export const TITLE_SCHEMA = {
-  type: 'OBJECT',
-  properties: {
-    title: { type: 'STRING' },
-  },
-  required: ['title'],
-} as const;
-
-export function responseSchemaFor(task: TaskId): object | undefined {
-  switch (task) {
-    case 'entry-analysis':
-      return ENTRY_ANALYSIS_SCHEMA;
-    case 'title-suggest':
-      return TITLE_SCHEMA;
-    default:
-      return undefined;
+    }
   }
 }
 

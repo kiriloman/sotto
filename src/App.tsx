@@ -1,14 +1,22 @@
 // Sotto — app shell and orchestration.
 // Owns: journal store, AI provider (real Firebase AI Logic or labeled demo
-// mode), device state, routing thresholds (Remote Config with local
-// defaults), and the inference ledger. All AI actions flow through the
-// router first; every outcome is recorded as a receipt.
+// mode), device state (single source: provider.probeDevice), routing
+// thresholds (Remote Config with local defaults), and the inference ledger.
+// All AI actions flow through the router first; every outcome is recorded as
+// a receipt, and every surfaced AI action carries a path badge.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { JournalStore, synthesisInput, todayISO, type JournalEntry, type InferenceReceipt } from './storage/db.ts';
-import { FirebaseAiProvider, MockProvider, type AiProvider } from './ai/provider.ts';
-import { parseEntryAnalysis, parseTitle, TASK_LABELS } from './ai/prompts.ts';
-import { setupFirebase, thresholdsFromRemoteConfig } from './firebase/app.ts';
+import {
+  JournalStore,
+  synthesisInput,
+  todayISO,
+  type JournalEntry,
+  type InferenceReceipt,
+} from './storage/db.ts';
+import { FirebaseAiProvider, MockProvider, type AiProvider, type RunOptions } from './ai/provider.ts';
+import { parseEntryAnalysis, parseTitle, TASK_LABELS, type DeepDiveTurn } from './ai/prompts.ts';
+import { setupFirebase, activateAndReadThresholds } from './firebase/app.ts';
+import { EntrySync } from './firebase/sync.ts';
 import { DEFAULT_THRESHOLDS, type RoutingThresholds, type DeviceState } from './router/policy.ts';
 import { RouterBadge } from './ui/RouterBadge.tsx';
 
@@ -21,13 +29,16 @@ const MOOD_EMOJI: Record<string, string> = {
 export default function App() {
   const [store] = useState(() => new JournalStore());
   const [provider, setProvider] = useState<AiProvider | null>(null);
+  const [sync, setSync] = useState<EntrySync | null>(null);
+  const [syncEnabled, setSyncEnabled] = useState(false);
   const [device, setDevice] = useState<DeviceState>({ onDeviceAvailability: 'unavailable', online: true });
   const [thresholds, setThresholds] = useState<RoutingThresholds>({ ...DEFAULT_THRESHOLDS });
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [receipts, setReceipts] = useState<InferenceReceipt[]>([]);
   const [tab, setTab] = useState<Tab>('journal');
   const [downloadPct, setDownloadPct] = useState<number | null>(null);
-  const [modelInit, setModelInit] = useState(false);
+  const [initError, setInitError] = useState('');
+  const [search, setSearch] = useState('');
 
   // Boot: open store, wire Firebase (or demo mode), probe device.
   useEffect(() => {
@@ -39,21 +50,27 @@ export default function App() {
       if (fb) {
         const p = new FirebaseAiProvider(fb.app);
         setProvider(p);
-        setThresholds(thresholdsFromRemoteConfig(fb.remoteConfig));
+        setDevice(await p.probeDevice());
+        const s = new EntrySync(fb.app);
+        setSync(s);
+        void s.start();
+        // Remote Config: first paint uses local defaults; fetched values
+        // apply as soon as the fetch resolves.
+        void activateAndReadThresholds(fb.remoteConfig).then(setThresholds);
       } else {
         setProvider(new MockProvider());
       }
     })();
   }, [store]);
 
-  // Re-probe on online/offline changes.
+  // Re-probe on online/offline changes (the provider also re-probes before
+  // every decision — this keeps the header status fresh).
   useEffect(() => {
     const onChange = async () => {
       if (provider) setDevice(await provider.probeDevice());
     };
     window.addEventListener('online', onChange);
     window.addEventListener('offline', onChange);
-    onChange();
     return () => {
       window.removeEventListener('online', onChange);
       window.removeEventListener('offline', onChange);
@@ -66,28 +83,37 @@ export default function App() {
   }, [store]);
 
   const runTask = useCallback(
-    async (
-      task: Parameters<AiProvider['run']>[0],
-      input: string,
-      privacy: 'private' | 'standard',
-      opts?: { entryId?: string; extra?: string }
-    ) => {
-      if (!provider) return { text: '' };
+    async (task: Parameters<AiProvider['run']>[0], input: string, privacy: 'private' | 'standard', opts?: RunOptions) => {
+      if (!provider) return { text: '', receipt: null };
       const out = await provider.run(task, input, privacy, { ...opts, thresholds });
       await store.addReceipt(out.receipt);
       setReceipts(await store.listReceipts());
-      return out;
+      return { text: out.text, receipt: out.receipt };
     },
     [provider, store, thresholds]
   );
 
+  const maybeSync = useCallback(
+    async (entry: JournalEntry) => {
+      if (syncEnabled && sync) {
+        const result = await sync.syncEntry(entry);
+        if (result === 'skipped-private') {
+          console.info('[Sotto] private entry not synced (structurally excluded)');
+        }
+      }
+    },
+    [sync, syncEnabled]
+  );
+
   const initializeModel = useCallback(async () => {
     if (!provider || provider.mode !== 'real') return;
+    setInitError('');
     setDownloadPct(0);
     try {
       await provider.initializeDeviceModel((pct: number) => setDownloadPct(pct));
-      setModelInit(true);
       setDevice(await provider.probeDevice());
+    } catch (err) {
+      setInitError(err instanceof Error ? err.message : String(err));
     } finally {
       setDownloadPct(null);
     }
@@ -97,7 +123,9 @@ export default function App() {
     const parts: string[] = [];
     parts.push(device.online ? 'online' : 'offline');
     parts.push(`on-device model: ${device.onDeviceAvailability}`);
-    parts.push(provider?.mode === 'demo' ? 'demo mode (no Firebase config)' : provider ? 'Firebase AI Logic' : '…');
+    parts.push(
+      provider?.mode === 'demo' ? 'demo mode (no Firebase config)' : provider ? 'Firebase AI Logic' : '…'
+    );
     return parts;
   }, [device, provider]);
 
@@ -105,7 +133,10 @@ export default function App() {
     <>
       <header className="app">
         <h1>
-          Sotto <span className="quiet">a journal that thinks locally — every AI decision shows where your words went</span>
+          Sotto{' '}
+          <span className="quiet">
+            a journal that thinks locally — every AI decision shows where your words went
+          </span>
         </h1>
         <div className="status">
           {statusLine.map((s, i) => (
@@ -118,6 +149,7 @@ export default function App() {
               <button className="ghost" style={{ marginTop: 6 }} onClick={initializeModel} disabled={downloadPct !== null}>
                 {downloadPct !== null ? `downloading model… ${Math.round(downloadPct * 100)}%` : 'prepare on-device model'}
               </button>
+              {initError && <div className="warn" style={{ marginTop: 4, maxWidth: 260 }}>{initError}</div>}
             </div>
           )}
         </div>
@@ -125,9 +157,10 @@ export default function App() {
 
       {provider?.mode === 'demo' && (
         <div className="demo-banner">
-          <b>Demo mode</b> — running without Firebase configuration. All routing logic is real; responses are
-      labeled deterministic mocks. To go live: create a Firebase project, enable <b>AI Logic</b> (Gemini
-      Developer API), register a web app, then set <code>window.__SOTTO_FIREBASE_CONFIG__</code> (see README).
+          <b>Demo mode</b> — running without Firebase configuration. All routing logic, privacy rules, and
+          the inference ledger are real; responses are deterministic mocks marked 🧪. To go live: create
+          a Firebase project, enable <b>AI Logic</b> (Gemini Developer API), register a web app, then set{' '}
+          <code>window.__SOTTO_FIREBASE_CONFIG__</code> (see README).
         </div>
       )}
 
@@ -137,6 +170,15 @@ export default function App() {
             {t === 'journal' ? 'Journal' : t === 'week' ? 'Week in review' : `Inference ledger (${receipts.length})`}
           </button>
         ))}
+        <label className="sync-toggle" title="Opt-in Firestore sync for standard-tier entries (private entries are structurally excluded)">
+          <input
+            type="checkbox"
+            checked={syncEnabled}
+            disabled={!sync}
+            onChange={(e) => setSyncEnabled(e.target.checked)}
+          />{' '}
+          cloud backup (standard entries)
+        </label>
       </nav>
 
       {tab === 'journal' && (
@@ -149,61 +191,89 @@ export default function App() {
                 try {
                   const analysis = parseEntryAnalysis(out.text);
                   await store.saveEntry({ ...saved, analysis, mood: analysis.mood });
-                } catch { /* analysis optional — entry already saved */ }
+                } catch {
+                  /* entry is saved regardless; analysis is best-effort */
+                }
               }
+              await maybeSync({ ...saved, analysis: undefined });
               await refreshEntries();
             }}
             onSuggestTitle={async (body, privacy) => {
               const out = await runTask('title-suggest', body, privacy);
               if (!out.text) return '';
-              try { return parseTitle(out.text); } catch { return ''; }
-            }}
-            device={device}
-            demo={provider?.mode === 'demo'}
-          />
-          <EntryList
-            entries={entries}
-            onReflect={async (e) => {
-              const out = await runTask('quick-reflection', e.body, e.privacy, { entryId: e.id });
-              if (out.text) {
-                await store.saveEntry({ ...e, reflection: out.text });
-                await refreshEntries();
+              try {
+                return parseTitle(out.text);
+              } catch {
+                return '';
               }
             }}
-            onDeepDive={async (e, question) => {
-              const out = await runTask('deep-dive', e.body, e.privacy, { entryId: e.id, extra: question });
-              return out.text || 'Unavailable: see the inference ledger for why.';
+          />
+          <div className="search-row">
+            <input
+              type="text"
+              placeholder="Search entries (local, no AI)…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              aria-label="Search entries"
+            />
+          </div>
+          <EntryList
+            entries={filterEntries(entries, search)}
+            onReflect={async (e) => {
+              await runTask('quick-reflection', e.body, e.privacy, { entryId: e.id });
+              await refreshEntries();
+            }}
+            onDeepDive={async (e, question, history) => {
+              const out = await runTask('deep-dive', e.body, e.privacy, {
+                entryId: e.id,
+                extra: question,
+                history: history.map((t) => ({ q: t.q, a: t.a })),
+              });
+              return out.text || '';
+            }}
+            onSaveDeepDive={async (e, turns) => {
+              await store.saveEntry({ ...e, deepDive: turns });
+              await refreshEntries();
+            }}
+            onEdit={async (e) => {
+              await store.saveEntry(e);
+              await refreshEntries();
             }}
             onDelete={async (id) => {
               await store.deleteEntry(id);
+              if (sync) await sync.removeEntry(id);
               await refreshEntries();
             }}
-            modelReady={modelInit || device.onDeviceAvailability === 'available'}
+            device={device}
+            onPrepareModel={initializeModel}
           />
         </>
       )}
 
-      {tab === 'week' && <WeeklySynthesis entries={entries} runTask={runTask} />}
+      {tab === 'week' && <WeeklySynthesis entries={entries} runTask={runTask} device={device} />}
 
       {tab === 'ledger' && (
         <div className="panel ledger">
           <h2 style={{ marginTop: 0, fontSize: 18 }}>Inference ledger</h2>
           <p className="hint">
-            Every AI action Sotto has taken, where it ran, and why. This transparency is the point —
-            a routing decision you can't audit is a routing decision you can't trust.
+            Every AI action Sotto has taken, where it ran, and why — including the <b>requested</b> path
+            versus where the SDK <b>actually</b> served it (drift shows in red). This transparency is the
+            point: a routing decision you can't audit is a routing decision you can't trust.
           </p>
           {receipts.length === 0 && <div className="empty">No AI actions yet.</div>}
           {receipts.map((r) => (
-            <div className="receipt" key={r.id}>
+            <div className={`receipt${r.drifted ? ' drifted' : ''}`} key={r.id}>
               <div className="top">
                 <div>
                   <RouterBadge path={r.path} mode={r.mode} />{' '}
                   <b>{TASK_LABELS[r.task as keyof typeof TASK_LABELS] ?? r.task}</b>
+                  {r.drifted && <span className="drift-tag"> requested {r.requestedPath} → served {r.path}</span>}
                 </div>
                 <span className="when">
                   {new Date(r.at).toLocaleString()} · {r.inputChars.toLocaleString()} chars
                   {r.latencyMs !== undefined ? ` · ${r.latencyMs} ms` : ''}
                   {r.inferenceSource ? ` · SDK: ${r.inferenceSource}` : ''}
+                  {r.requestedMode ? ` · mode: ${r.requestedMode}` : ''}
                 </span>
               </div>
               <ul className="reasons">
@@ -219,9 +289,17 @@ export default function App() {
   );
 }
 
-/* ---------- Journal tab ---------- */
+/** Local, deterministic search — no AI involved (by design; see README). */
+function filterEntries(entries: JournalEntry[], query: string): JournalEntry[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter((e) => {
+    const hay = `${e.title}\n${e.body}\n${e.analysis?.themes.join(' ') ?? ''}\n${e.reflection ?? ''}`;
+    return hay.toLowerCase().includes(q);
+  });
+}
 
-import { useRef, useState as useLocalState } from 'react';
+/* ---------- Journal tab ---------- */
 
 interface Draft {
   title: string;
@@ -233,21 +311,19 @@ interface Draft {
 function EntryEditor(props: {
   onSave: (d: Draft) => Promise<void>;
   onSuggestTitle: (body: string, privacy: 'private' | 'standard') => Promise<string>;
-  device: DeviceState;
-  demo?: boolean;
 }) {
-  const [title, setTitle] = useLocalState('');
-  const [body, setBody] = useLocalState('');
-  const [privacy, setPrivacy] = useLocalState<'private' | 'standard'>('private');
-  const [date, setDate] = useLocalState(todayISO());
-  const [busy, setBusy] = useLocalState(false);
-  const [saved, setSaved] = useLocalState(false);
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [privacy, setPrivacy] = useState<'private' | 'standard'>('private');
+  const [date, setDate] = useState(todayISO());
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   const canSave = body.trim().length > 0 && !busy;
   const privacyHint =
     privacy === 'private'
-      ? 'Private entries never leave this device — AI runs on-device only (Chrome model required for analysis).'
-      : 'Standard entries prefer on-device but may fall back to cloud Gemini when the device model is unavailable.';
+      ? 'Private: analysis runs ONLY on this device. Until the on-device model is ready (Chrome 139+, one-time ~2 GB download), private AI features politely wait — they never send.'
+      : 'Standard: analysis prefers the on-device model; if unavailable, it falls back to cloud Gemini with your knowledge.';
 
   return (
     <div className="panel">
@@ -293,31 +369,41 @@ function EntryEditor(props: {
       />
 
       <div className="row">
-        <button className="primary" disabled={!canSave} onClick={async () => {
-          setBusy(true);
-          try {
-            await props.onSave({ title: title.trim(), body: body.trim(), privacy, date });
-            setTitle(''); setBody(''); setSaved(true);
-            setTimeout(() => setSaved(false), 2500);
-          } finally { setBusy(false); }
-        }}>
+        <button
+          className="primary"
+          disabled={!canSave}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await props.onSave({ title: title.trim(), body: body.trim(), privacy, date });
+              setTitle('');
+              setBody('');
+              setSaved(true);
+              setTimeout(() => setSaved(false), 2500);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
           {busy ? 'Saving & analyzing…' : 'Save entry'}
         </button>
         <button
           className="ghost"
           disabled={body.trim().length < 20 || busy}
-          title="Generate a title with AI"
+          title="Generate a title with AI (routed per your privacy tier)"
           onClick={async () => {
             setBusy(true);
             try {
               const t = await props.onSuggestTitle(body.trim(), privacy);
               if (t) setTitle(t);
-            } finally { setBusy(false); }
+            } finally {
+              setBusy(false);
+            }
           }}
         >
           Suggest title
         </button>
-        {saved && <span className="hint">Saved — see the analysis chip below the entry. ✦</span>}
+        {saved && <span className="hint">Saved. ✦</span>}
       </div>
     </div>
   );
@@ -326,15 +412,20 @@ function EntryEditor(props: {
 function EntryList(props: {
   entries: JournalEntry[];
   onReflect: (e: JournalEntry) => Promise<void>;
-  onDeepDive: (e: JournalEntry, q: string) => Promise<string>;
+  onDeepDive: (e: JournalEntry, question: string, history: DeepDiveTurn[]) => Promise<string>;
+  onSaveDeepDive: (e: JournalEntry, turns: DeepDiveTurn[]) => Promise<void>;
+  onEdit: (e: JournalEntry) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
-  modelReady: boolean;
+  device: DeviceState;
+  onPrepareModel: () => Promise<void>;
 }) {
-  const [busyId, setBusyId] = useLocalState<string | null>(null);
-  const [diveId, setDiveId] = useLocalState<string | null>(null);
-  const [diveQ, setDiveQ] = useLocalState('');
-  const [diveA, setDiveA] = useLocalState('');
-  const diveRef = useRef<HTMLInputElement>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [diveId, setDiveId] = useState<string | null>(null);
+  const [diveQ, setDiveQ] = useState('');
+  const [editId, setEditId] = useState<string | null>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editBody, setEditBody] = useState('');
 
   if (props.entries.length === 0) {
     return <div className="panel empty">Nothing here yet — your first entry is one paragraph away.</div>;
@@ -350,107 +441,295 @@ function EntryList(props: {
               {e.date} · {e.privacy === 'private' ? '🔒 private' : '☁️ standard'}
             </span>
           </header>
-          <div className="body">{e.body}</div>
-          {e.analysis && (
-            <div className="analysis">
-              <span className="mood">{MOOD_EMOJI[e.analysis.mood] ?? '😐'}</span>
-              {e.analysis.oneLineSummary}
-              <div className="themes">
-                {e.analysis.themes.map((t) => (
-                  <span key={t}>{t}</span>
-                ))}
-              </div>
-            </div>
-          )}
-          {e.reflection && <div className="reflection">{e.reflection}</div>}
-          {diveId === e.id && diveA && <div className="analysis">{diveA}</div>}
-          <div className="row">
-            <button className="ghost" disabled={busyId === e.id} onClick={async () => {
-              setBusyId(e.id);
-              try { await props.onReflect(e); } finally { setBusyId(null); }
-            }}>
-              {busyId === e.id ? 'Reflecting…' : 'Reflect on this'}
-            </button>
-            {diveId === e.id ? (
-              <>
-                <input
-                  ref={diveRef}
-                  type="text"
-                  placeholder="Ask anything about this entry…"
-                  value={diveQ}
-                  style={{ flex: 1, minWidth: 200 }}
-                  onChange={(ev) => setDiveQ(ev.target.value)}
-                  onKeyDown={async (ev) => {
-                    if (ev.key === 'Enter' && diveQ.trim()) {
-                      setDiveA(await props.onDeepDive(e, diveQ.trim()));
-                    }
+
+          {editId === e.id ? (
+            <>
+              <label>Editing — title</label>
+              <input type="text" value={editTitle} onChange={(ev) => setEditTitle(ev.target.value)} />
+              <label>Editing — entry</label>
+              <textarea value={editBody} onChange={(ev) => setEditBody(ev.target.value)} />
+              <div className="row">
+                <button
+                  className="primary"
+                  onClick={async () => {
+                    await props.onEdit({
+                      ...e,
+                      title: editTitle.trim() || e.title,
+                      body: editBody.trim() || e.body,
+                    });
+                    setEditId(null);
                   }}
-                />
+                >
+                  Save changes
+                </button>
+                <button className="ghost" onClick={() => setEditId(null)}>
+                  Cancel
+                </button>
+                <span className="hint">Editing keeps the analysis attached; re-save to refresh it.</span>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="body">{e.body}</div>
+
+              {e.analysis && (
+                <div className="analysis">
+                  <span className="mood">{MOOD_EMOJI[e.analysis.mood] ?? '😐'}</span>
+                  {e.analysis.oneLineSummary}
+                  <div className="themes">
+                    {e.analysis.themes.map((t) => (
+                      <span key={t}>{t}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!e.analysis && e.privacy === 'private' && props.device.onDeviceAvailability !== 'available' && (
+                <div className="analysis pending">
+                  🔒 Analysis pending — the on-device model isn't ready yet, and a private entry will
+                  never be sent to the cloud instead.{' '}
+                  <button className="linkish" onClick={props.onPrepareModel}>
+                    Prepare the on-device model
+                  </button>{' '}
+                  (one-time ~2 GB download).
+                </div>
+              )}
+
+              {e.reflection ? (
+                <div className="reflection">
+                  {e.reflection}
+                  <div style={{ marginTop: 6 }}>
+                    <RouterBadge path={e.privacy === 'private' ? 'on-device' : 'cloud'} />
+                  </div>
+                </div>
+              ) : null}
+
+              {diveId === e.id && (
+                <div className="analysis">
+                  {e.deepDive?.map((t, i) => (
+                    <div key={i} className="dive-turn">
+                      <div className="q">Q: {t.q}</div>
+                      <div className="a">{t.a}</div>
+                    </div>
+                  ))}
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <input
+                      type="text"
+                      placeholder="Ask anything about this entry…"
+                      value={diveQ}
+                      style={{ flex: 1, minWidth: 200 }}
+                      onChange={(ev) => setDiveQ(ev.target.value)}
+                      onKeyDown={async (ev) => {
+                        if (ev.key === 'Enter' && diveQ.trim()) {
+                          const answer = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
+                          if (answer) {
+                            await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: answer, at: Date.now() }]);
+                            setDiveQ('');
+                          }
+                        }
+                      }}
+                    />
+                    <button
+                      className="ghost"
+                      disabled={!diveQ.trim() || busyId === e.id}
+                      onClick={async () => {
+                        setBusyId(e.id);
+                        try {
+                          const answer = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
+                          if (answer) {
+                            await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: answer, at: Date.now() }]);
+                            setDiveQ('');
+                          }
+                        } finally {
+                          setBusyId(null);
+                        }
+                      }}
+                    >
+                      Ask
+                    </button>
+                    <RouterBadge path={e.privacy === 'private' ? 'degraded' : 'cloud'} />
+                  </div>
+                  {e.privacy === 'private' && (
+                    <div className="hint" style={{ marginTop: 6 }}>
+                      Deep dive keeps a conversation — cloud only. A private entry's deep dive politely
+                      declines; switch the entry to standard to enable it.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="row">
                 <button
                   className="ghost"
-                  disabled={!diveQ.trim()}
-                  onClick={async () => setDiveA(await props.onDeepDive(e, diveQ.trim()))}
+                  disabled={busyId === e.id}
+                  onClick={async () => {
+                    setBusyId(e.id);
+                    try {
+                      await props.onReflect(e);
+                    } finally {
+                      setBusyId(null);
+                    }
+                  }}
                 >
-                  Ask
+                  {busyId === e.id ? 'Reflecting…' : e.reflection ? 'Reflect again' : 'Reflect on this'}
                 </button>
-              </>
-            ) : (
-              <button className="ghost" onClick={() => { setDiveId(e.id); setDiveA(''); setDiveQ(''); setTimeout(() => diveRef.current?.focus(), 50); }}>
-                Deep dive
-              </button>
-            )}
-            <button className="ghost" style={{ marginLeft: 'auto' }} onClick={() => props.onDelete(e.id)}>Delete</button>
-          </div>
+                {diveId === e.id ? (
+                  <button className="ghost" onClick={() => setDiveId(null)}>
+                    Close dive
+                  </button>
+                ) : (
+                  <button className="ghost" onClick={() => { setDiveId(e.id); setDiveQ(''); }}>
+                    Deep dive {e.deepDive?.length ? `(${e.deepDive.length})` : ''}
+                  </button>
+                )}
+                <button
+                  className="ghost"
+                  onClick={() => {
+                    setEditId(e.id);
+                    setEditTitle(e.title);
+                    setEditBody(e.body);
+                  }}
+                >
+                  Edit
+                </button>
+                {confirmId === e.id ? (
+                  <>
+                    <button className="ghost danger" onClick={() => { void props.onDelete(e.id); setConfirmId(null); }}>
+                      Confirm delete
+                    </button>
+                    <button className="ghost" onClick={() => setConfirmId(null)}>
+                      Keep it
+                    </button>
+                  </>
+                ) : (
+                  <button className="ghost" style={{ marginLeft: 'auto' }} onClick={() => setConfirmId(e.id)}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </>
+          )}
         </article>
       ))}
+      <ExportBar entries={props.entries} />
     </>
+  );
+}
+
+function ExportBar(props: { entries: JournalEntry[] }) {
+  const download = (content: string, filename: string, type: string) => {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const md = () =>
+    props.entries
+      .slice()
+      .sort((a, b) => (a.date < b.date ? -1 : 1))
+      .map((e) => `# ${e.date} — ${e.title || '(untitled)'} (${e.privacy})\n\n${e.body}\n${e.reflection ? `\n> ${e.reflection}\n` : ''}`)
+      .join('\n---\n\n');
+  return (
+    <div className="row" style={{ justifyContent: 'center' }}>
+      <span className="hint">Your words, yours to take:</span>
+      <button className="ghost" onClick={() => download(JSON.stringify(props.entries, null, 2), 'sotto-journal.json', 'application/json')}>
+        Export JSON
+      </button>
+      <button className="ghost" onClick={() => download(md(), 'sotto-journal.md', 'text/markdown')}>
+        Export Markdown
+      </button>
+    </div>
   );
 }
 
 function WeeklySynthesis(props: {
   entries: JournalEntry[];
   runTask: (task: 'weekly-synthesis', input: string, privacy: 'private' | 'standard', opts?: { extra?: string }) => Promise<{ text: string }>;
+  device: DeviceState;
 }) {
   const today = new Date();
   const weekAgo = new Date(today.getTime() - 6 * 86400_000);
-  const [from, setFrom] = useLocalState(weekAgo.toISOString().slice(0, 10));
-  const [to, setTo] = useLocalState(today.toISOString().slice(0, 10));
-  const [privacy, setPrivacy] = useLocalState<'private' | 'standard'>('standard');
-  const [result, setResult] = useLocalState('');
-  const [busy, setBusy] = useLocalState(false);
-  const [error, setError] = useLocalState('');
+  const [from, setFrom] = useState(weekAgo.toISOString().slice(0, 10));
+  const [to, setTo] = useState(today.toISOString().slice(0, 10));
+  // Safe default: 'private' = this synthesis never sends to cloud. The user
+  // must explicitly choose standard to allow their entries to leave the device.
+  const [privacy, setPrivacy] = useState<'private' | 'standard'>('private');
+  const [result, setResult] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
-  const inRange = useMemo(
-    () => props.entries.filter((e) => e.date >= from && e.date <= to),
-    [props.entries, from, to]
-  );
+  const inRange = useMemo(() => props.entries.filter((e) => e.date >= from && e.date <= to), [props.entries, from, to]);
   const privateCount = inRange.filter((e) => e.privacy === 'private').length;
 
+  // No-AI mood timeline — deterministic, local, free.
+  const moodTimeline = useMemo(
+    () =>
+      inRange
+        .filter((e) => e.mood)
+        .sort((a, b) => (a.date < b.date ? -1 : 1))
+        .map((e) => ({ date: e.date, mood: e.mood!, emoji: MOOD_EMOJI[e.mood!] ?? '😐' })),
+    [inRange]
+  );
+  const streak = useMemo(() => {
+    const dates = new Set(props.entries.map((e) => e.date));
+    let n = 0;
+    const d = new Date();
+    while (dates.has(d.toISOString().slice(0, 10))) {
+      n++;
+      d.setDate(d.getDate() - 1);
+    }
+    return n;
+  }, [props.entries]);
+
   const run = async () => {
-    setBusy(true); setError(''); setResult('');
+    setBusy(true);
+    setError('');
+    setResult('');
     try {
       const { text: joined } = synthesisInput(props.entries, from, to);
       const { text } = await props.runTask('weekly-synthesis', joined, privacy, { extra: `${from} to ${to}` });
       if (text) setResult(text);
       else setError('Synthesis unavailable — open the Inference ledger to see exactly why.');
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="panel">
       <h2 style={{ marginTop: 0, fontSize: 18 }}>Week in review</h2>
       <p className="hint">
-        Synthesis reads your full history for the period — that exceeds the on-device model's input
-        cap, so it always runs in the cloud. Private entries are only included if you explicitly
-        choose standard-tier synthesis; a fully-private week will simply decline.
+        Synthesis reads your full history for the period and prefers cloud reasoning quality — but a
+        small week that fits the on-device model runs locally when you choose Private only. Private
+        entries never leave this device unless you explicitly pick Standard for this synthesis.
       </p>
+
+      {moodTimeline.length > 0 && (
+        <div className="mood-timeline" aria-label="Mood timeline (deterministic, no AI)">
+          <span className="hint">Mood this week:</span>{' '}
+          {moodTimeline.map((m) => (
+            <span key={m.date} title={`${m.date} — ${m.mood}`}>
+              {m.emoji}
+            </span>
+          ))}
+          {streak > 1 && <span className="hint" style={{ marginLeft: 8 }}>🔥 {streak}-day streak</span>}
+        </div>
+      )}
+
       <div className="row">
         <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} style={{ width: 170 }} />
         <span className="hint">to</span>
         <input type="date" value={to} onChange={(e) => setTo(e.target.value)} style={{ width: 170 }} />
         <div className="privacy-toggle">
-          <button className={privacy === 'private' ? 'active-private' : ''} onClick={() => setPrivacy('private')}>🔒 Private only</button>
-          <button className={privacy === 'standard' ? 'active-standard' : ''} onClick={() => setPrivacy('standard')}>☁️ Standard</button>
+          <button className={privacy === 'private' ? 'active-private' : ''} onClick={() => setPrivacy('private')} title="Never sends to cloud">
+            🔒 Private only
+          </button>
+          <button className={privacy === 'standard' ? 'active-standard' : ''} onClick={() => setPrivacy('standard')} title="May send entries to cloud Gemini">
+            ☁️ Standard
+          </button>
         </div>
         <button className="primary" disabled={busy || inRange.length === 0} onClick={run}>
           {busy ? 'Synthesizing…' : `Synthesize ${inRange.length} entr${inRange.length === 1 ? 'y' : 'ies'}`}
@@ -459,12 +738,19 @@ function WeeklySynthesis(props: {
       {privateCount > 0 && (
         <p className="privacy-note">
           {privateCount} private {privateCount === 1 ? 'entry is' : 'entries are'} in this range — with
-          “Private only” they stay on-device and synthesis will decline; with “Standard” they will be
-          sent to cloud Gemini for this synthesis only.
+          “🔒 Private only” the synthesis either runs fully on-device (small week) or declines; with
+          “☁️ Standard” your entries will be sent to cloud Gemini for this synthesis only.
         </p>
       )}
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
-      {result && <div className="synthesis panel" style={{ marginTop: 12 }}>{result}</div>}
+      {result && (
+        <div className="synthesis panel" style={{ marginTop: 12 }}>
+          {result}
+          <div style={{ marginTop: 8 }}>
+            <RouterBadge path={privacy === 'private' ? (props.device.onDeviceAvailability === 'available' ? 'on-device' : 'degraded') : 'cloud'} />
+          </div>
+        </div>
+      )}
       {inRange.length === 0 && <div className="empty">No entries in this range yet.</div>}
     </div>
   );
