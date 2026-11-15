@@ -13,7 +13,7 @@ export function RouterBadge({ path, mode }: { path: string; mode?: 'real' | 'dem
   return (
     <span className={v.cls}>
       {v.label}
-      {mode === 'demo' ? ' (demo)' : ''}
+      {mode === 'demo' && path !== 'mock' ? ' (demo)' : ''}
     </span>
   );
 }

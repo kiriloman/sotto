@@ -30,6 +30,7 @@ interface SyncedEntry {
   body: string;
   mood?: string;
   analysis?: JournalEntry['analysis'];
+  reflection?: string;
   updatedAt: number;
 }
 
@@ -73,6 +74,7 @@ export class EntrySync {
       body: entry.body,
       mood: entry.mood,
       analysis: entry.analysis,
+      reflection: entry.reflection,
       updatedAt: entry.updatedAt,
     };
     try {

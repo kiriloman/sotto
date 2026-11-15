@@ -131,7 +131,8 @@ export default function App() {
   const statusLine = useMemo(() => {
     const parts: string[] = [];
     parts.push(device.online ? 'online' : 'offline');
-    parts.push(`on-device model: ${device.onDeviceAvailability}`);
+    // In demo mode the "available" model is simulated — say so.
+    parts.push(provider?.mode === 'demo' ? 'on-device model: simulated (demo)' : `on-device model: ${device.onDeviceAvailability}`);
     parts.push(
       provider?.mode === 'demo' ? 'demo mode (no Firebase config)' : provider ? 'Firebase AI Logic' : '…'
     );
@@ -251,16 +252,25 @@ export default function App() {
               await refreshEntries();
             }}
             onEdit={async (e) => {
+              const wasStandard = entries.find((x) => x.id === e.id)?.privacy === 'standard';
               await store.saveEntry(e);
-              await maybeSync(e); // re-sync on edit — no stale cloud copy
+              // Standard→private: the old cloud copy must GO, not linger —
+              // leaving it would be the exact expectation this product sells.
+              if (syncEnabled && sync && wasStandard && e.privacy === 'private') {
+                await sync.removeEntry(e.id);
+              } else {
+                await maybeSync(e); // re-sync on edit — no stale cloud copy
+              }
               await refreshEntries();
             }}
             onReanalyze={async (e) => {
               const out = await runTask('entry-analysis', e.body, e.privacy, { entryId: e.id });
+              let updated = e;
               if (out.text) {
                 try {
                   const analysis = parseEntryAnalysis(out.text);
-                  await store.saveEntry({ ...e, analysis, mood: analysis.mood });
+                  updated = await store.saveEntry({ ...e, analysis, mood: analysis.mood });
+                  await maybeSync(updated); // keep the cloud analysis fresh too
                 } catch {
                   /* keep old analysis on parse failure */
                 }
@@ -279,6 +289,22 @@ export default function App() {
             onSampleWeek={async (week) => {
               for (const d of week) {
                 await store.saveEntry(d);
+              }
+              // The 30-second demo: analyze each sample entry so chips, moods,
+              // and the timeline appear immediately (demo mocks are fast, and
+              // every analysis lands in the inference ledger too).
+              const saved = await store.listEntries();
+              const fresh = saved.filter((x) => week.some((w) => w.date === x.date && w.title === x.title));
+              for (const e of fresh) {
+                const out = await runTask('entry-analysis', e.body, e.privacy, { entryId: e.id });
+                if (out.text) {
+                  try {
+                    const analysis = parseEntryAnalysis(out.text);
+                    await store.saveEntry({ ...e, analysis, mood: analysis.mood });
+                  } catch {
+                    /* best-effort */
+                  }
+                }
               }
               await refreshEntries();
             }}
@@ -706,9 +732,13 @@ function EntryList(props: {
                 >
                   Edit
                 </button>
-                {e.analysis && (
+                {e.analysis ? (
                   <button className="ghost" disabled={busyId === e.id} onClick={() => void props.onReanalyze(e)}>
                     Re-analyze
+                  </button>
+                ) : (
+                  <button className="ghost" disabled={busyId === e.id} onClick={() => void props.onReanalyze(e)}>
+                    Analyze
                   </button>
                 )}
                 {confirmId === e.id ? (
@@ -806,6 +836,9 @@ function WeeklySynthesis(props: {
 
   const inRange = useMemo(() => props.entries.filter((e) => e.date >= from && e.date <= to), [props.entries, from, to]);
   const privateCount = inRange.filter((e) => e.privacy === 'private').length;
+  // Included count for the CURRENT toggle: private tier includes everything
+  // (routes on-device/degrades); standard tier excludes private entries.
+  const includedCount = privacy === 'private' ? inRange.length : inRange.length - privateCount;
 
   // No-AI mood timeline — deterministic, local, free.
   const moodTimeline = useMemo(
@@ -888,10 +921,16 @@ function WeeklySynthesis(props: {
             ☁️ Standard
           </button>
         </div>
-        <button className="primary" disabled={busy || inRange.length === 0} onClick={run}>
-          {busy ? 'Synthesizing…' : `Synthesize ${inRange.length} entr${inRange.length === 1 ? 'y' : 'ies'}`}
+        <button className="primary" disabled={busy || includedCount === 0} onClick={run}>
+          {busy ? 'Synthesizing…' : `Synthesize ${includedCount} entr${includedCount === 1 ? 'y' : 'ies'}`}
         </button>
       </div>
+      {includedCount === 0 && inRange.length > 0 && (
+        <p className="privacy-note">
+          Every entry in this range is 🔒 private — a Standard synthesis would have nothing to send.
+          Choose “🔒 Private only” to run it on-device instead.
+        </p>
+      )}
       {privateCount > 0 && (
         <p className="privacy-note">
           {privateCount} private {privateCount === 1 ? 'entry is' : 'entries are'} in this range. Private
