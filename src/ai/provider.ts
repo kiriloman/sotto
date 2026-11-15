@@ -26,7 +26,7 @@ import type { InferenceReceipt } from '../storage/db.ts';
 export interface InferenceOutcome {
   text: string;
   decision: RouteDecision;
-  receipt: Omit<InferenceReceipt, 'id' | 'at'>;
+  receipt: Omit<InferenceReceipt, 'id' | 'at'> & { path: 'on-device' | 'cloud' | 'degraded' | 'mock' | 'unknown' };
 }
 
 export interface RunOptions {
@@ -119,8 +119,15 @@ export class FirebaseAiProvider implements AiProvider {
     const latencyMs = Math.round(performance.now() - t0);
     // SDK values are lowercase snake_case ('on_device' | 'in_cloud') — compare
     // case-insensitively so a casing change can never mislabel the ledger.
-    const actualPath: 'on-device' | 'cloud' =
-      String(inferenceSource ?? '').toLowerCase() === 'on_device' ? 'on-device' : 'cloud';
+    // A MISSING source is never assumed to be cloud: for ONLY_ON_DEVICE a
+    // success can only have run on-device (the mode throws otherwise), and
+    // anything else records 'unknown' rather than a false drift claim.
+    const source = String(inferenceSource ?? '').toLowerCase();
+    let actualPath: 'on-device' | 'cloud' | 'unknown';
+    if (source === 'on_device') actualPath = 'on-device';
+    else if (source === 'in_cloud') actualPath = 'cloud';
+    else if (mode === 'ONLY_ON_DEVICE') actualPath = 'on-device';
+    else actualPath = 'unknown';
     const drifted = decision.path === 'on-device' && actualPath === 'cloud';
     return {
       text,

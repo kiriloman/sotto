@@ -187,15 +187,16 @@ export default function App() {
             onSave={async (draft) => {
               const saved = await store.saveEntry({ ...draft, date: draft.date || todayISO() });
               const out = await runTask('entry-analysis', saved.body, saved.privacy, { entryId: saved.id });
+              let final = saved;
               if (out.text) {
                 try {
                   const analysis = parseEntryAnalysis(out.text);
-                  await store.saveEntry({ ...saved, analysis, mood: analysis.mood });
+                  final = await store.saveEntry({ ...saved, analysis, mood: analysis.mood });
                 } catch {
                   /* entry is saved regardless; analysis is best-effort */
                 }
               }
-              await maybeSync({ ...saved, analysis: undefined });
+              await maybeSync(final); // sync AFTER analysis is persisted — no stale cloud copy
               await refreshEntries();
             }}
             onSuggestTitle={async (body, privacy) => {
@@ -220,8 +221,13 @@ export default function App() {
           <EntryList
             entries={filterEntries(entries, search)}
             onReflect={async (e) => {
-              await runTask('quick-reflection', e.body, e.privacy, { entryId: e.id });
+              const out = await runTask('quick-reflection', e.body, e.privacy, { entryId: e.id });
+              if (out.text) {
+                await store.saveEntry({ ...e, reflection: out.text });
+                await maybeSync({ ...e, reflection: out.text });
+              }
               await refreshEntries();
+              return out.receipt ? out.receipt.path : null;
             }}
             onDeepDive={async (e, question, history) => {
               const out = await runTask('deep-dive', e.body, e.privacy, {
@@ -229,7 +235,7 @@ export default function App() {
                 extra: question,
                 history: history.map((t) => ({ q: t.q, a: t.a })),
               });
-              return out.text || '';
+              return { text: out.text, path: out.receipt ? out.receipt.path : null };
             }}
             onSaveDeepDive={async (e, turns) => {
               await store.saveEntry({ ...e, deepDive: turns });
@@ -237,6 +243,19 @@ export default function App() {
             }}
             onEdit={async (e) => {
               await store.saveEntry(e);
+              await maybeSync(e); // re-sync on edit — no stale cloud copy
+              await refreshEntries();
+            }}
+            onReanalyze={async (e) => {
+              const out = await runTask('entry-analysis', e.body, e.privacy, { entryId: e.id });
+              if (out.text) {
+                try {
+                  const analysis = parseEntryAnalysis(out.text);
+                  await store.saveEntry({ ...e, analysis, mood: analysis.mood });
+                } catch {
+                  /* keep old analysis on parse failure */
+                }
+              }
               await refreshEntries();
             }}
             onDelete={async (id) => {
@@ -246,6 +265,14 @@ export default function App() {
             }}
             device={device}
             onPrepareModel={initializeModel}
+            allEntries={entries}
+            searchQuery={search}
+            onSampleWeek={async (week) => {
+              for (const d of week) {
+                await store.saveEntry(d);
+              }
+              await refreshEntries();
+            }}
           />
         </>
       )}
@@ -297,6 +324,11 @@ function filterEntries(entries: JournalEntry[], query: string): JournalEntry[] {
     const hay = `${e.title}\n${e.body}\n${e.analysis?.themes.join(' ') ?? ''}\n${e.reflection ?? ''}`;
     return hay.toLowerCase().includes(q);
   });
+}
+
+function daysAgoISO(n: number): string {
+  const d = new Date(Date.now() - n * 86400_000);
+  return d.toISOString().slice(0, 10);
 }
 
 /* ---------- Journal tab ---------- */
@@ -411,13 +443,24 @@ function EntryEditor(props: {
 
 function EntryList(props: {
   entries: JournalEntry[];
-  onReflect: (e: JournalEntry) => Promise<void>;
-  onDeepDive: (e: JournalEntry, question: string, history: DeepDiveTurn[]) => Promise<string>;
+  onReflect: (e: JournalEntry) => Promise<'on-device' | 'cloud' | 'degraded' | 'mock' | 'unknown' | null>;
+  onDeepDive: (
+    e: JournalEntry,
+    question: string,
+    history: DeepDiveTurn[]
+  ) => Promise<{ text: string; path: 'on-device' | 'cloud' | 'degraded' | 'mock' | 'unknown' | null }>;
   onSaveDeepDive: (e: JournalEntry, turns: DeepDiveTurn[]) => Promise<void>;
   onEdit: (e: JournalEntry) => Promise<void>;
+  onReanalyze: (e: JournalEntry) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   device: DeviceState;
   onPrepareModel: () => Promise<void>;
+  /** The FULL journal for exports — never the search-filtered subset. */
+  allEntries: JournalEntry[];
+  /** Current search query — to distinguish 'no entries' from 'no matches'. */
+  searchQuery: string;
+  /** Load a clearly-labeled sample week (demo/first-run helper). */
+  onSampleWeek: (week: Omit<JournalEntry, 'id' | 'createdAt' | 'updatedAt'>[]) => Promise<void>;
 }) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [diveId, setDiveId] = useState<string | null>(null);
@@ -426,9 +469,41 @@ function EntryList(props: {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editBody, setEditBody] = useState('');
+  const [editPrivacy, setEditPrivacy] = useState<'private' | 'standard'>('private');
+  // Receipt-path badges: what the receipt SAID, not what the privacy tier implies.
+  const [reflectBadge, setReflectBadge] = useState<Record<string, string | null>>({});
+  const [diveBadge, setDiveBadge] = useState<Record<string, string | null>>({});
+
+  const sampleWeek = useMemo(
+    () => [
+      { date: daysAgoISO(6), title: 'Slow start', body: 'Woke up heavy, dragged myself through the morning. Coffee helped more than it should. Work was a blur of small tasks that never ended.', privacy: 'private' as const },
+      { date: daysAgoISO(5), title: 'Better shape', body: 'Slept well. Had a good focus block before lunch and finally closed the thing I had been avoiding. Evening walk cleared my head.', privacy: 'private' as const },
+      { date: daysAgoISO(4), title: 'Family dinner', body: 'Long dinner with everyone at the table. Loud, warm, a bit tiring — the good kind. Noticed how much lighter the mood has been lately.', privacy: 'standard' as const },
+      { date: daysAgoISO(3), title: 'Tired but proud', body: 'Shipped the project milestone. Exhausted, but proud of how the team held together when the demo almost broke. Slept early.', privacy: 'standard' as const },
+      { date: daysAgoISO(2), title: 'Quiet day', body: 'Nothing dramatic. Read, ran errands, called mom. Energy steady. These are the days I used to skip writing about.', privacy: 'private' as const },
+      { date: daysAgoISO(1), title: 'Ideas returning', body: 'Curiosity is back — a long list of things I want to learn next month. Great to feel excited about something again.', privacy: 'private' as const },
+    ],
+    []
+  );
 
   if (props.entries.length === 0) {
-    return <div className="panel empty">Nothing here yet — your first entry is one paragraph away.</div>;
+    return (
+      <>
+        <div className="panel empty">
+          {props.searchQuery
+            ? `No entries match “${props.searchQuery}” — try a different word, or clear the search.`
+            : 'Nothing here yet — your first entry is one paragraph away.'}
+          {!props.searchQuery && props.allEntries.length === 0 && (
+            <div style={{ marginTop: 12 }}>
+              <button className="ghost" onClick={() => void props.onSampleWeek(sampleWeek)}>
+                Load a sample week (6 entries, deletable — great for seeing the full flow)
+              </button>
+            </div>
+          )}
+        </div>
+        <ExportBar entries={props.allEntries} />
+      </>
+    );
   }
 
   return (
@@ -449,6 +524,22 @@ function EntryList(props: {
               <label>Editing — entry</label>
               <textarea value={editBody} onChange={(ev) => setEditBody(ev.target.value)} />
               <div className="row">
+                <div className="privacy-toggle">
+                  <button
+                    className={editPrivacy === 'private' ? 'active-private' : ''}
+                    onClick={() => setEditPrivacy('private')}
+                    title="On-device only, cloud forbidden"
+                  >
+                    🔒 Private
+                  </button>
+                  <button
+                    className={editPrivacy === 'standard' ? 'active-standard' : ''}
+                    onClick={() => setEditPrivacy('standard')}
+                    title="Prefer on-device, cloud fallback allowed"
+                  >
+                    ☁️ Standard
+                  </button>
+                </div>
                 <button
                   className="primary"
                   onClick={async () => {
@@ -456,6 +547,7 @@ function EntryList(props: {
                       ...e,
                       title: editTitle.trim() || e.title,
                       body: editBody.trim() || e.body,
+                      privacy: editPrivacy,
                     });
                     setEditId(null);
                   }}
@@ -465,7 +557,7 @@ function EntryList(props: {
                 <button className="ghost" onClick={() => setEditId(null)}>
                   Cancel
                 </button>
-                <span className="hint">Editing keeps the analysis attached; re-save to refresh it.</span>
+                <span className="hint">Changing privacy applies to future AI actions on this entry.</span>
               </div>
             </>
           ) : (
@@ -499,7 +591,11 @@ function EntryList(props: {
                 <div className="reflection">
                   {e.reflection}
                   <div style={{ marginTop: 6 }}>
-                    <RouterBadge path={e.privacy === 'private' ? 'on-device' : 'cloud'} />
+                    {reflectBadge[e.id] ? (
+                      <RouterBadge path={reflectBadge[e.id] as string} />
+                    ) : (
+                      <span className="hint">path recorded in the inference ledger</span>
+                    )}
                   </div>
                 </div>
               ) : null}
@@ -520,11 +616,17 @@ function EntryList(props: {
                       style={{ flex: 1, minWidth: 200 }}
                       onChange={(ev) => setDiveQ(ev.target.value)}
                       onKeyDown={async (ev) => {
-                        if (ev.key === 'Enter' && diveQ.trim()) {
-                          const answer = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
-                          if (answer) {
-                            await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: answer, at: Date.now() }]);
-                            setDiveQ('');
+                        if (ev.key === 'Enter' && diveQ.trim() && busyId !== e.id) {
+                          setBusyId(e.id);
+                          try {
+                            const { text, path } = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
+                            if (text) {
+                              await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: text, at: Date.now() }]);
+                              setDiveBadge((b) => ({ ...b, [e.id]: path }));
+                              setDiveQ('');
+                            }
+                          } finally {
+                            setBusyId(null);
                           }
                         }
                       }}
@@ -535,9 +637,10 @@ function EntryList(props: {
                       onClick={async () => {
                         setBusyId(e.id);
                         try {
-                          const answer = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
-                          if (answer) {
-                            await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: answer, at: Date.now() }]);
+                          const { text, path } = await props.onDeepDive(e, diveQ.trim(), e.deepDive ?? []);
+                          if (text) {
+                            await props.onSaveDeepDive(e, [...(e.deepDive ?? []), { q: diveQ.trim(), a: text, at: Date.now() }]);
+                            setDiveBadge((b) => ({ ...b, [e.id]: path }));
                             setDiveQ('');
                           }
                         } finally {
@@ -547,7 +650,7 @@ function EntryList(props: {
                     >
                       Ask
                     </button>
-                    <RouterBadge path={e.privacy === 'private' ? 'degraded' : 'cloud'} />
+                    {diveBadge[e.id] && <RouterBadge path={diveBadge[e.id] as string} />}
                   </div>
                   {e.privacy === 'private' && (
                     <div className="hint" style={{ marginTop: 6 }}>
@@ -565,7 +668,8 @@ function EntryList(props: {
                   onClick={async () => {
                     setBusyId(e.id);
                     try {
-                      await props.onReflect(e);
+                      const path = await props.onReflect(e);
+                      if (path) setReflectBadge((b) => ({ ...b, [e.id]: path }));
                     } finally {
                       setBusyId(null);
                     }
@@ -588,10 +692,16 @@ function EntryList(props: {
                     setEditId(e.id);
                     setEditTitle(e.title);
                     setEditBody(e.body);
+                    setEditPrivacy(e.privacy);
                   }}
                 >
                   Edit
                 </button>
+                {e.analysis && (
+                  <button className="ghost" disabled={busyId === e.id} onClick={() => void props.onReanalyze(e)}>
+                    Re-analyze
+                  </button>
+                )}
                 {confirmId === e.id ? (
                   <>
                     <button className="ghost danger" onClick={() => { void props.onDelete(e.id); setConfirmId(null); }}>
@@ -611,11 +721,15 @@ function EntryList(props: {
           )}
         </article>
       ))}
-      <ExportBar entries={props.entries} />
+      <ExportBar entries={props.allEntries} />
     </>
   );
 }
 
+/** Export bar — ALWAYS exports the full journal, never the search-filtered
+ *  subset (a silent partial export is a data-loss footgun for the 'your
+ *  words, yours to take' promise). The parent passes ALL entries separately
+ *  from the filtered list it renders. */
 function ExportBar(props: { entries: JournalEntry[] }) {
   const download = (content: string, filename: string, type: string) => {
     const blob = new Blob([content], { type });
@@ -630,11 +744,22 @@ function ExportBar(props: { entries: JournalEntry[] }) {
     props.entries
       .slice()
       .sort((a, b) => (a.date < b.date ? -1 : 1))
-      .map((e) => `# ${e.date} — ${e.title || '(untitled)'} (${e.privacy})\n\n${e.body}\n${e.reflection ? `\n> ${e.reflection}\n` : ''}`)
+      .map((e) => {
+        const mood = e.analysis ? ` · ${e.analysis.mood}` : '';
+        const themes = e.analysis?.themes.length ? ` · ${e.analysis.themes.join(', ')}` : '';
+        const dive = (e.deepDive ?? [])
+          .map((t) => `\n**Q:** ${t.q}\n**A:** ${t.a}`)
+          .join('\n');
+        return (
+          `# ${e.date} — ${e.title || '(untitled)'} (${e.privacy}${mood}${themes})\n\n${e.body}` +
+          (e.reflection ? `\n> ${e.reflection}\n` : '') +
+          (dive ? `\n## Conversation\n${dive}\n` : '')
+        );
+      })
       .join('\n---\n\n');
   return (
     <div className="row" style={{ justifyContent: 'center' }}>
-      <span className="hint">Your words, yours to take:</span>
+      <span className="hint">Your words, yours to take (exports the full journal):</span>
       <button className="ghost" onClick={() => download(JSON.stringify(props.entries, null, 2), 'sotto-journal.json', 'application/json')}>
         Export JSON
       </button>
@@ -647,7 +772,12 @@ function ExportBar(props: { entries: JournalEntry[] }) {
 
 function WeeklySynthesis(props: {
   entries: JournalEntry[];
-  runTask: (task: 'weekly-synthesis', input: string, privacy: 'private' | 'standard', opts?: { extra?: string }) => Promise<{ text: string }>;
+  runTask: (
+    task: 'weekly-synthesis',
+    input: string,
+    privacy: 'private' | 'standard',
+    opts?: { extra?: string }
+  ) => Promise<{ text: string; receipt: { path: string } | null }>;
   device: DeviceState;
 }) {
   const today = new Date();
@@ -655,11 +785,15 @@ function WeeklySynthesis(props: {
   const [from, setFrom] = useState(weekAgo.toISOString().slice(0, 10));
   const [to, setTo] = useState(today.toISOString().slice(0, 10));
   // Safe default: 'private' = this synthesis never sends to cloud. The user
-  // must explicitly choose standard to allow their entries to leave the device.
+  // must explicitly choose standard to allow entries to leave the device —
+  // and even then, PRIVATE entries are excluded from the input (their
+  // per-entry hard rule cannot be overridden by a synthesis toggle).
   const [privacy, setPrivacy] = useState<'private' | 'standard'>('private');
   const [result, setResult] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [badge, setBadge] = useState<string | null>(null);
+  const [excludedNote, setExcludedNote] = useState('');
 
   const inRange = useMemo(() => props.entries.filter((e) => e.date >= from && e.date <= to), [props.entries, from, to]);
   const privateCount = inRange.filter((e) => e.privacy === 'private').length;
@@ -689,10 +823,18 @@ function WeeklySynthesis(props: {
     setError('');
     setResult('');
     try {
-      const { text: joined } = synthesisInput(props.entries, from, to);
-      const { text } = await props.runTask('weekly-synthesis', joined, privacy, { extra: `${from} to ${to}` });
-      if (text) setResult(text);
+      // Private entries are structurally excluded from a standard synthesis —
+      // the per-entry hard rule cannot be overridden by an aggregate toggle.
+      const { text: joined, excludedPrivate } = synthesisInput(props.entries, from, to);
+      setExcludedNote(
+        excludedPrivate > 0
+          ? `${excludedPrivate} private ${excludedPrivate === 1 ? 'entry was' : 'entries were'} kept on this device and excluded from the synthesis — their 🔒 rule is not overridden by this toggle.`
+          : ''
+      );
+      const out = await props.runTask('weekly-synthesis', joined, privacy, { extra: `${from} to ${to}` });
+      if (out.text) setResult(out.text);
       else setError('Synthesis unavailable — open the Inference ledger to see exactly why.');
+      setBadge(out.receipt ? out.receipt.path : null);
     } finally {
       setBusy(false);
     }
@@ -702,9 +844,10 @@ function WeeklySynthesis(props: {
     <div className="panel">
       <h2 style={{ marginTop: 0, fontSize: 18 }}>Week in review</h2>
       <p className="hint">
-        Synthesis reads your full history for the period and prefers cloud reasoning quality — but a
+        Synthesis reads your history for the period and prefers cloud reasoning quality — but a
         small week that fits the on-device model runs locally when you choose Private only. Private
-        entries never leave this device unless you explicitly pick Standard for this synthesis.
+        entries are always excluded from a Standard synthesis: their 🔒 per-entry rule cannot be
+        overridden by this toggle, no matter what you pick here.
       </p>
 
       {moodTimeline.length > 0 && (
@@ -737,9 +880,9 @@ function WeeklySynthesis(props: {
       </div>
       {privateCount > 0 && (
         <p className="privacy-note">
-          {privateCount} private {privateCount === 1 ? 'entry is' : 'entries are'} in this range — with
-          “🔒 Private only” the synthesis either runs fully on-device (small week) or declines; with
-          “☁️ Standard” your entries will be sent to cloud Gemini for this synthesis only.
+          {privateCount} private {privateCount === 1 ? 'entry is' : 'entries are'} in this range. Private
+          entries always stay on this device — a Standard synthesis includes only your standard
+          entries; “🔒 Private only” runs the whole synthesis on-device (small week) or declines.
         </p>
       )}
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
@@ -747,10 +890,11 @@ function WeeklySynthesis(props: {
         <div className="synthesis panel" style={{ marginTop: 12 }}>
           {result}
           <div style={{ marginTop: 8 }}>
-            <RouterBadge path={privacy === 'private' ? (props.device.onDeviceAvailability === 'available' ? 'on-device' : 'degraded') : 'cloud'} />
+            {badge ? <RouterBadge path={badge} /> : <span className="hint">path recorded in the inference ledger</span>}
           </div>
         </div>
       )}
+      {excludedNote && <p className="privacy-note">{excludedNote}</p>}
       {inRange.length === 0 && <div className="empty">No entries in this range yet.</div>}
     </div>
   );

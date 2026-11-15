@@ -29,8 +29,9 @@ export interface InferenceReceipt {
   at: number;
   task: string;
   entryId?: string;
-  /** Where the work actually ran ('mock' = deterministic demo response). */
-  path: 'on-device' | 'cloud' | 'degraded' | 'mock';
+  /** Where the work actually ran ('mock' = deterministic demo response,
+   *  'unknown' = the SDK did not report a source). */
+  path: 'on-device' | 'cloud' | 'degraded' | 'mock' | 'unknown';
   /** Where the router decided it should run. */
   requestedPath?: 'on-device' | 'cloud' | 'degraded';
   /** The InferenceMode string sent to the SDK. */
@@ -171,13 +172,23 @@ export class JournalStore {
     });
   }
 }
-/** Entries eligible for a synthesis over a date range (inclusive), joined oldest-first. */
-export function synthesisInput(entries: JournalEntry[], fromISO: string, toISO: string): { text: string; count: number } {
+/** Entries eligible for a synthesis over a date range (inclusive), joined oldest-first.
+ *  Private entries are EXCLUDED unless includePrivate is explicitly set —
+ *  per-entry privacy is a hard rule; a standard-tier synthesis must not
+ *  silently drag private bodies to the cloud with it. */
+export function synthesisInput(
+  entries: JournalEntry[],
+  fromISO: string,
+  toISO: string,
+  opts?: { includePrivate?: boolean }
+): { text: string; count: number; excludedPrivate: number } {
   const inRange = entries
     .filter((e) => e.date >= fromISO && e.date <= toISO)
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.createdAt - b.createdAt));
-  const text = inRange
+  const excludedPrivate = opts?.includePrivate ? 0 : inRange.filter((e) => e.privacy === 'private').length;
+  const included = opts?.includePrivate ? inRange : inRange.filter((e) => e.privacy !== 'private');
+  const text = included
     .map((e) => `[${e.date}] ${e.title || '(untitled)'} (${e.privacy})\n${e.body}`)
     .join('\n\n');
-  return { text, count: inRange.length };
+  return { text, count: included.length, excludedPrivate };
 }

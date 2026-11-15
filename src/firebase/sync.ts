@@ -66,7 +66,8 @@ export class EntrySync {
   async syncEntry(entry: JournalEntry): Promise<'synced' | 'skipped-private' | 'unavailable'> {
     if (!this.app || !this.user) return 'unavailable';
     if (entry.privacy === 'private') return 'skipped-private'; // hard exclusion
-    const payload: SyncedEntry = {
+    const payload: SyncedEntry & { ownerUid: string } = {
+      ownerUid: this.user.uid, // firestore.rules enforce owner-only access
       date: entry.date,
       title: entry.title,
       body: entry.body,

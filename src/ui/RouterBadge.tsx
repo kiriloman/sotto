@@ -7,6 +7,7 @@ export function RouterBadge({ path, mode }: { path: string; mode?: 'real' | 'dem
     cloud: { label: '☁️ cloud', cls: 'badge badge-cloud' },
     mock: { label: '🧪 demo', cls: 'badge badge-mock' },
     degraded: { label: '✕ unavailable', cls: 'badge badge-degraded' },
+    unknown: { label: '? source not reported', cls: 'badge badge-mock' },
   };
   const v = map[path] ?? { label: path, cls: 'badge' };
   return (

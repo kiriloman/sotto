@@ -48,9 +48,13 @@ export function readFirebaseConfig(): SottoFirebaseConfig | null {
   }
 }
 
+let firebaseBootstrapped = false; // React StrictMode double-mount guard
+
 export function setupFirebase(): FirebaseSetup | null {
+  if (firebaseBootstrapped) return null; // already initialized this session
   const config = readFirebaseConfig();
   if (!config) return null;
+  firebaseBootstrapped = true;
 
   const app = initializeApp(config);
 

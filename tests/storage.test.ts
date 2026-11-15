@@ -56,3 +56,28 @@ test('synthesisInput: date range filter, oldest-first order, includes dates+titl
   assert.ok(text.indexOf('[2026-11-10] First') < text.indexOf('[2026-11-12] Second'));
   assert.ok(!text.includes('Outside'));
 });
+
+test('synthesisInput: private entries are EXCLUDED by default — a standard synthesis cannot drag private bodies to the cloud', async () => {
+  const s = new JournalStore('memory');
+  await s.open();
+  await s.saveEntry({ title: 'Public one', body: 'shared body', privacy: 'standard', date: '2026-11-10' });
+  await s.saveEntry({ title: 'Secret one', body: 'PRIVATE BODY MUST NOT LEAK', privacy: 'private', date: '2026-11-11' });
+  await s.saveEntry({ title: 'Public two', body: 'also shared', privacy: 'standard', date: '2026-11-12' });
+  const entries = await s.listEntries();
+  const { text, count, excludedPrivate } = synthesisInput(entries, '2026-11-09', '2026-11-14');
+  assert.equal(count, 2);
+  assert.equal(excludedPrivate, 1);
+  assert.ok(!text.includes('PRIVATE BODY MUST NOT LEAK'), 'private body must never enter a synthesis input');
+  assert.ok(text.includes('shared body'));
+});
+
+test('synthesisInput: includePrivate opt-in includes them (explicit, per-synthesis)', async () => {
+  const s = new JournalStore('memory');
+  await s.open();
+  await s.saveEntry({ title: 'Secret one', body: 'PRIVATE BODY', privacy: 'private', date: '2026-11-11' });
+  const entries = await s.listEntries();
+  const { text, count, excludedPrivate } = synthesisInput(entries, '2026-11-09', '2026-11-14', { includePrivate: true });
+  assert.equal(count, 1);
+  assert.equal(excludedPrivate, 0);
+  assert.ok(text.includes('PRIVATE BODY'));
+});
